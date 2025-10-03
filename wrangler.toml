@@ -1,0 +1,3 @@
+name = "giscus-proxy"
+main = "worker.ts"
+compatibility_date = "2025-10-03"
