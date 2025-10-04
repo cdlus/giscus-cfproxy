@@ -14,7 +14,7 @@ const PATTERN_POWERED_BY =
 const REPLACEMENT_POWERED_BY = `"poweredBy":""`;
 
 // Short TTL while developing
-const CACHE_TTL_SECONDS = 30;
+const CACHE_TTL_SECONDS = 300;
 
 export default {
   async fetch(req) {
