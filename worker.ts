@@ -1,97 +1,114 @@
-// Reverse proxy for giscus.app (minimal, plain JS)
+const CSS_PREFIX = "/_next/static/css/";
+const CSS_SUFFIX = ".css";
 
-// ---- optional: keep your widget "poweredBy" rewrite
+// Append to all CSS so it always wins in cascade order
+const INJECT_CSS =
+  "\n/* giscus proxy override */\n" +
+  ".gsc-upvote-button{display:none!important}\n" +
+  ".gsc-upvotes{display:none!important}\n";
+
+// Optional: keep your widget poweredBy rewrite
 const TARGET_WIDGET_PATH = "/en/widget";
 const PATTERN_POWERED_BY =
   `"poweredBy":"– powered by \\u003ca\\u003egiscus\\u003c/a\\u003e"`;
 const REPLACEMENT_POWERED_BY = `"poweredBy":""`;
 
-// ---- CSS target
-const CSS_PREFIX = "/_next/static/css/";
-const CSS_SUFFIX = ".css";
-
-// exact token in the minified CSS you pasted:
-//   .gsc-upvote-button{font-weight:500}.gsc-upvote-button:disabled{...}
-const PATTERN_UPVOTE_CSS_1 = `.gsc-upvote-button{font-weight:500}`;
-const PATTERN_UPVOTE_CSS_2 = `.gsc-upvote-button{font-weight: 500}`; // just-in-case variant
-const REPLACEMENT_UPVOTE_CSS = `.gsc-upvote-button{display:none !important}`;
-
-// short TTL for dev
-const CACHE_TTL_SECONDS = 300;
+// Short TTL while developing
+const CACHE_TTL_SECONDS = 30;
 
 export default {
   async fetch(req) {
     const url = new URL(req.url);
-    const isWidget = url.pathname === TARGET_WIDGET_PATH;
     const isCss = url.pathname.startsWith(CSS_PREFIX) && url.pathname.endsWith(CSS_SUFFIX);
-
-    // allow ad-hoc cache bypass while debugging
+    const isWidget = url.pathname === TARGET_WIDGET_PATH;
     const noCache = url.searchParams.has("nocache");
 
-    // upstream url on giscus.app
+    // Proxy target on giscus.app
     const upstreamURL = new URL(url.pathname + url.search, "https://giscus.app");
-
-    const shouldCache = !noCache && (isWidget || isCss) && req.method === "GET";
     const cacheKey = new Request(upstreamURL.toString());
 
-    if (shouldCache) {
-      const hit = await caches.default.match(cacheKey);
-      if (hit) return addDebug(hit, { Cache: "HIT", Widget: isWidget, Css: isCss });
-    }
-
-    // fetch upstream, keep body editable
-    const fwd = new Headers(req.headers);
-    fwd.set("accept-encoding", "identity");
-
-    const upstream = await fetch(upstreamURL.toString(), {
-      method: req.method,
-      headers: fwd,
-      body: (req.method === "GET" || req.method === "HEAD") ? undefined : await req.blob(),
-    });
-
-    const ct = upstream.headers.get("content-type") || "";
-    const enc = upstream.headers.get("content-encoding") || "";
-    const textLike = /json|text|javascript|css/i.test(ct);
-
-    // pass-through if not our targets or not text-ish or encoded
-    if ((!isWidget && !isCss) || !textLike || enc) {
-      return addDebug(upstream, {
-        Cache: "BYPASS",
-        Reason: (!textLike ? "not-text" : (enc ? "encoded" : "not-target")),
+    // Quick purge hook (per colo)
+    if (url.searchParams.has("purge") && req.method === "GET") {
+      const ok = await caches.default.delete(cacheKey);
+      return new Response("purged:" + ok, {
+        headers: { "X-Debug-Purged": String(ok) },
       });
     }
 
-    // read & rewrite
+    // Only cache widget; don't cache CSS while iterating
+    const shouldCache = !noCache && isWidget && req.method === "GET";
+    if (shouldCache) {
+      const hit = await caches.default.match(cacheKey);
+      if (hit) return addDebug(hit, { Cache: "HIT", Css: false, Widget: true });
+    }
+
+    // Keep body editable; DO NOT auto-follow redirects
+    const h = new Headers(req.headers);
+    h.set("accept-encoding", "identity");
+
+    const upstream = await fetch(upstreamURL.toString(), {
+      method: req.method,
+      headers: h,
+      body: (req.method === "GET" || req.method === "HEAD") ? undefined : await req.blob(),
+      redirect: "manual", // <- key: forward 3xx instead of following
+    });
+
+    // If upstream responds with a redirect, forward it as-is
+    if (upstream.status >= 300 && upstream.status < 400) {
+      const loc = upstream.headers.get("location");
+      if (loc) {
+        // Make sure Location is absolute
+        const absolute = new URL(loc, upstreamURL).toString();
+        const out = new Headers();
+        out.set("Location", absolute);
+        out.set("Cache-Control", "no-store");
+        out.set("X-Debug-Redirect", "forwarded");
+        out.set("X-Debug-Location", absolute);
+        return new Response(null, { status: upstream.status, headers: out });
+      }
+      // No Location? Just forward the status with no body
+      return new Response(null, {
+        status: upstream.status,
+        headers: { "Cache-Control": "no-store", "X-Debug-Redirect": "no-location" },
+      });
+    }
+
+    // Non-redirects continue below
+    const ct = upstream.headers.get("content-type") || "";
+    const enc = upstream.headers.get("content-encoding") || "";
+
+    if (!/text|json|javascript|css/i.test(ct) || enc) {
+      return addDebug(upstream, {
+        Cache: "BYPASS",
+        Reason: enc ? "encoded" : "not-text",
+      });
+    }
+
     let body = await upstream.text();
     let poweredByCount = 0;
-    let cssUpvoteCount = 0;
+    let appended = 0;
 
+    // Optional widget tweak
     if (isWidget) {
-      poweredByCount = count(body, PATTERN_POWERED_BY);
-      if (poweredByCount) body = body.replaceAll(PATTERN_POWERED_BY, REPLACEMENT_POWERED_BY);
+      const before = body;
+      body = body.replaceAll(PATTERN_POWERED_BY, REPLACEMENT_POWERED_BY);
+      poweredByCount = before === body ? 0 : 1;
     }
 
-    if (isCss) {
-      // exact minified match first
-      const c1 = count(body, PATTERN_UPVOTE_CSS_1);
-      if (c1) {
-        body = body.replaceAll(PATTERN_UPVOTE_CSS_1, REPLACEMENT_UPVOTE_CSS);
-        cssUpvoteCount += c1;
-      } else {
-        // fallback with optional space after colon
-        const c2 = count(body, PATTERN_UPVOTE_CSS_2);
-        if (c2) {
-          body = body.replaceAll(PATTERN_UPVOTE_CSS_2, REPLACEMENT_UPVOTE_CSS);
-          cssUpvoteCount += c2;
-        }
-      }
+    // Append our override to any CSS file so it always wins
+    if (isCss && !body.includes(".gsc-upvote-button{display:none")) {
+      body += INJECT_CSS;
+      appended = 1;
     }
 
-    // fix headers after mutation
+    // Fix headers
     const out = new Headers(upstream.headers);
     out.delete("content-length");
     out.delete("content-encoding");
-    out.set("cache-control", `public, max-age=0, s-maxage=${CACHE_TTL_SECONDS}`);
+    out.set(
+      "cache-control",
+      isCss ? "no-store" : `public, max-age=0, s-maxage=${CACHE_TTL_SECONDS}`
+    );
 
     const rewritten = new Response(body, {
       status: upstream.status,
@@ -102,22 +119,15 @@ export default {
     if (shouldCache) await caches.default.put(cacheKey, rewritten.clone());
 
     return addDebug(rewritten, {
-      Cache: shouldCache ? "MISS_STORED" : "BYPASS",
+      Cache: shouldCache ? "MISS_STORED" : (isCss ? "NO_STORE" : "BYPASS"),
+      CssAppended: appended,
       PoweredByRepl: poweredByCount,
-      CssUpvoteRepl: cssUpvoteCount,
     });
   },
 };
 
-// --- helpers
-function count(haystack, needle) {
-  if (!needle) return 0;
-  let c = 0, i = 0;
-  while ((i = haystack.indexOf(needle, i)) !== -1) { c++; i += needle.length; }
-  return c;
-}
 function addDebug(res, info) {
   const h = new Headers(res.headers);
-  for (const [k, v] of Object.entries(info)) h.set(`X-Debug-${k}`, String(v));
+  Object.entries(info).forEach(([k, v]) => h.set(`X-Debug-${k}`, String(v)));
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
 }
