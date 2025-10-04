@@ -1,137 +1,123 @@
-// Minimal reverse proxy for giscus.app with simple logging
+// Reverse proxy for giscus.app (minimal, plain JS)
 
-// 1) /en/widget → remove "powered by"
+// ---- optional: keep your widget "poweredBy" rewrite
 const TARGET_WIDGET_PATH = "/en/widget";
 const PATTERN_POWERED_BY =
   `"poweredBy":"– powered by \\u003ca\\u003egiscus\\u003c/a\\u003e"`;
 const REPLACEMENT_POWERED_BY = `"poweredBy":""`;
 
-// 2) /_next/static/chunks/4947-*.js → hide the upvote button
-const CHUNK_PREFIX = "/_next/static/chunks/4947-";
-const CHUNK_SUFFIX = ".js";
+// ---- CSS target
+const CSS_PREFIX = "/_next/static/css/";
+const CSS_SUFFIX = ".css";
 
-// EXACT snippet from your pasted chunk (minified)
-const PATTERN_UPVOTE =
-  `className:"gsc-upvote-button gsc-social-reaction-summary-item "+(t.viewerHasUpvoted?"has-reacted":""),onClick:R,`;
-// Inject a style prop to make it invisible
-const REPLACEMENT_UPVOTE =
-  `className:"gsc-upvote-button gsc-social-reaction-summary-item "+(t.viewerHasUpvoted?"has-reacted":""),style:{display:"none"},onClick:R,`;
+// exact token in the minified CSS you pasted:
+//   .gsc-upvote-button{font-weight:500}.gsc-upvote-button:disabled{...}
+const PATTERN_UPVOTE_CSS_1 = `.gsc-upvote-button{font-weight:500}`;
+const PATTERN_UPVOTE_CSS_2 = `.gsc-upvote-button{font-weight: 500}`; // just-in-case variant
+const REPLACEMENT_UPVOTE_CSS = `.gsc-upvote-button{display:none}`;
 
-// Optional edge cache for transformed bodies
-const CACHE_TTL_SECONDS = 300;
+// short TTL for dev
+const CACHE_TTL_SECONDS = 30;
 
 export default {
-  async fetch(req: Request): Promise<Response> {
+  async fetch(req) {
     const url = new URL(req.url);
     const isWidget = url.pathname === TARGET_WIDGET_PATH;
-    const isTargetChunk =
-      url.pathname.startsWith(CHUNK_PREFIX) && url.pathname.endsWith(CHUNK_SUFFIX);
+    const isCss = url.pathname.startsWith(CSS_PREFIX) && url.pathname.endsWith(CSS_SUFFIX);
 
-    // Upstream URL on giscus.app
+    // allow ad-hoc cache bypass while debugging
+    const noCache = url.searchParams.has("nocache");
+
+    // upstream url on giscus.app
     const upstreamURL = new URL(url.pathname + url.search, "https://giscus.app");
 
-    // Try cache only for GETs we rewrite
-    const shouldCache = (isWidget || isTargetChunk) && req.method === "GET";
+    const shouldCache = !noCache && (isWidget || isCss) && req.method === "GET";
     const cacheKey = new Request(upstreamURL.toString());
 
     if (shouldCache) {
       const hit = await caches.default.match(cacheKey);
-      if (hit) {
-        // Minimal logging for cache hits
-        console.log("[CACHE HIT]", url.pathname);
-        return addDebugHeaders(hit, { cache: "HIT" });
-      }
+      if (hit) return addDebug(hit, { Cache: "HIT", Widget: isWidget, Css: isCss });
     }
 
-    // Ensure upstream body is not compressed (so we can edit it)
-    const fwdHeaders = new Headers(req.headers);
-    fwdHeaders.set("accept-encoding", "identity");
+    // fetch upstream, keep body editable
+    const fwd = new Headers(req.headers);
+    fwd.set("accept-encoding", "identity");
 
     const upstream = await fetch(upstreamURL.toString(), {
       method: req.method,
-      headers: fwdHeaders,
-      body: (req.method === "GET" || req.method === "HEAD")
-        ? undefined
-        : await req.blob(),
+      headers: fwd,
+      body: (req.method === "GET" || req.method === "HEAD") ? undefined : await req.blob(),
     });
 
     const ct = upstream.headers.get("content-type") || "";
     const enc = upstream.headers.get("content-encoding") || "";
+    const textLike = /json|text|javascript|css/i.test(ct);
 
-    // Minimal upstream log
-    console.log("[UPSTREAM]", {
-      path: url.pathname,
-      status: upstream.status,
-      ct, enc,
-      widget: isWidget,
-      chunk4947: isTargetChunk,
-    });
-
-    // Pass through if not our targets or body is not text-ish or is encoded
-    const textLike = /json|text|javascript/i.test(ct);
-    if ((!isWidget && !isTargetChunk) || !textLike || enc) {
-      return addDebugHeaders(upstream, { cache: "BYPASS", reason: "no-rewrite" });
+    // pass-through if not our targets or not text-ish or encoded
+    if ((!isWidget && !isCss) || !textLike || enc) {
+      return addDebug(upstream, {
+        Cache: "BYPASS",
+        Reason: (!textLike ? "not-text" : (enc ? "encoded" : "not-target")),
+      });
     }
 
-    // Read, rewrite, and log counts
+    // read & rewrite
     let body = await upstream.text();
     let poweredByCount = 0;
-    let upvoteCount = 0;
+    let cssUpvoteCount = 0;
 
     if (isWidget) {
       poweredByCount = count(body, PATTERN_POWERED_BY);
       if (poweredByCount) body = body.replaceAll(PATTERN_POWERED_BY, REPLACEMENT_POWERED_BY);
     }
 
-    if (isTargetChunk) {
-      upvoteCount = count(body, PATTERN_UPVOTE);
-      if (upvoteCount) body = body.replaceAll(PATTERN_UPVOTE, REPLACEMENT_UPVOTE);
+    if (isCss) {
+      // exact minified match first
+      const c1 = count(body, PATTERN_UPVOTE_CSS_1);
+      if (c1) {
+        body = body.replaceAll(PATTERN_UPVOTE_CSS_1, REPLACEMENT_UPVOTE_CSS);
+        cssUpvoteCount += c1;
+      } else {
+        // fallback with optional space after colon
+        const c2 = count(body, PATTERN_UPVOTE_CSS_2);
+        if (c2) {
+          body = body.replaceAll(PATTERN_UPVOTE_CSS_2, REPLACEMENT_UPVOTE_CSS);
+          cssUpvoteCount += c2;
+        }
+      }
     }
 
-    console.log("[REWRITE]", {
-      path: url.pathname,
-      poweredByCount,
-      upvoteCount,
-    });
-
-    // Update headers (length/encoding change)
-    const outHeaders = new Headers(upstream.headers);
-    outHeaders.delete("content-length");
-    outHeaders.delete("content-encoding");
-    outHeaders.set("cache-control", `public, max-age=0, s-maxage=${CACHE_TTL_SECONDS}`);
+    // fix headers after mutation
+    const out = new Headers(upstream.headers);
+    out.delete("content-length");
+    out.delete("content-encoding");
+    out.set("cache-control", `public, max-age=0, s-maxage=${CACHE_TTL_SECONDS}`);
 
     const rewritten = new Response(body, {
       status: upstream.status,
       statusText: upstream.statusText,
-      headers: outHeaders,
+      headers: out,
     });
 
-    if (shouldCache) {
-      await caches.default.put(cacheKey, rewritten.clone());
-    }
+    if (shouldCache) await caches.default.put(cacheKey, rewritten.clone());
 
-    return addDebugHeaders(rewritten, {
-      cache: shouldCache ? "MISS_STORED" : "BYPASS",
-      poweredByCount,
-      upvoteCount,
+    return addDebug(rewritten, {
+      Cache: shouldCache ? "MISS_STORED" : "BYPASS",
+      PoweredByRepl: poweredByCount,
+      CssUpvoteRepl: cssUpvoteCount,
     });
   },
 };
 
-/** helpers */
-
-function count(haystack: string, needle: string): number {
+// --- helpers
+function count(haystack, needle) {
+  if (!needle) return 0;
   let c = 0, i = 0;
-  while ((i = haystack.indexOf(needle, i)) !== -1) {
-    c++; i += needle.length;
-  }
+  while ((i = haystack.indexOf(needle, i)) !== -1) { c++; i += needle.length; }
   return c;
 }
-
-function addDebugHeaders(res: Response, info: Record<string, unknown>): Response {
+function addDebug(res, info) {
   const h = new Headers(res.headers);
-  if (info.cache) h.set("X-Debug-Cache", String(info.cache));
-  if (typeof info.poweredByCount === "number") h.set("X-Debug-PoweredBy", String(info.poweredByCount));
-  if (typeof info.upvoteCount === "number") h.set("X-Debug-Upvote", String(info.upvoteCount));
+  for (const [k, v] of Object.entries(info)) h.set(`X-Debug-${k}`, String(v));
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
 }
