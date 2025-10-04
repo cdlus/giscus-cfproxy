@@ -14,10 +14,10 @@ const CSS_SUFFIX = ".css";
 //   .gsc-upvote-button{font-weight:500}.gsc-upvote-button:disabled{...}
 const PATTERN_UPVOTE_CSS_1 = `.gsc-upvote-button{font-weight:500}`;
 const PATTERN_UPVOTE_CSS_2 = `.gsc-upvote-button{font-weight: 500}`; // just-in-case variant
-const REPLACEMENT_UPVOTE_CSS = `.gsc-upvote-button{display:none}`;
+const REPLACEMENT_UPVOTE_CSS = `.gsc-upvote-button{display:none !important}`;
 
 // short TTL for dev
-const CACHE_TTL_SECONDS = 30;
+const CACHE_TTL_SECONDS = 5;
 
 export default {
   async fetch(req) {
