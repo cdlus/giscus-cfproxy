@@ -17,7 +17,7 @@ const PATTERN_UPVOTE_CSS_2 = `.gsc-upvote-button{font-weight: 500}`; // just-in-
 const REPLACEMENT_UPVOTE_CSS = `.gsc-upvote-button{display:none !important}`;
 
 // short TTL for dev
-const CACHE_TTL_SECONDS = 5;
+const CACHE_TTL_SECONDS = 300;
 
 export default {
   async fetch(req) {
